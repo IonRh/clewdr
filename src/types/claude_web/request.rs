@@ -1,4 +1,5 @@
 use serde::{Deserialize, Serialize};
+use serde_json::Value;
 
 use crate::types::claude::ImageSource;
 
@@ -42,21 +43,13 @@ pub struct WebRequestBody {
     pub timezone: String,
     #[serde(skip)]
     pub images: Vec<ImageSource>,
-    pub tools: Vec<Tool>,
+    pub tools: Vec<Value>,
 }
 
-#[derive(Deserialize, Serialize, Debug)]
-pub struct Tool {
-    pub name: String,
-    #[serde(rename = "type")]
-    pub type_: String,
-}
-
-impl Tool {
-    pub fn web_search() -> Self {
-        Tool {
-            name: "web_search".to_string(),
-            type_: "web_search_v0".to_string(),
-        }
-    }
+/// Built-in tool helper for web_search
+pub fn web_search_tool() -> Value {
+    serde_json::json!({
+        "name": "web_search",
+        "type": "web_search_v0"
+    })
 }

@@ -10,8 +10,8 @@ use crate::{
     claude_web_state::ClaudeWebState,
     error::ClewdrError,
     middleware::claude::{ClaudeApiFormat, ClaudeContext},
-    services::cookie_actor::CookieActorHandle,
-    types::claude::CreateMessageParams,
+    services::{cookie_actor::CookieActorHandle, tool_call::TOOL_CALL_MANAGER},
+    types::claude::{ContentBlock, CreateMessageParams, MessageContent, Role},
     utils::{enabled, print_out_json},
 };
 
@@ -118,6 +118,33 @@ impl LLMProvider for ClaudeWebProvider {
                 msg: "Unsupported operation for Claude Web",
             });
         }
+
+        // Check if this is a tool_result request
+        if let Some(tool_use_id) = extract_tool_result_id(&params) {
+            info!("[TOOL] detected tool_result for: {tool_use_id}");
+            if let Some(tool_state) = TOOL_CALL_MANAGER.take(&tool_use_id).await {
+                let mut session = tool_state.session;
+                session.stream = stream;
+                session.api_format = context.api_format();
+                session.usage = context.usage().to_owned();
+                session.last_params = Some(params.clone());
+
+                // Build tool_result payload from the last user message
+                let tool_result_payload = build_tool_result_payload(&params);
+
+                let stopwatch = Instant::now();
+                let wreq_res = session.send_tool_result(tool_result_payload).await?;
+                let response = session.transform_response(wreq_res).await?;
+                let elapsed = stopwatch.elapsed();
+                info!(
+                    "[TOOL] tool_result response elapsed: {}s",
+                    format!("{}", elapsed.as_secs_f32()).green()
+                );
+                return Ok(ClaudeProviderResponse { context, response });
+            }
+            info!("[TOOL] no pending session found, treating as normal request");
+        }
+
         let format_display = match context.api_format() {
             ClaudeApiFormat::Claude => ClaudeApiFormat::Claude.to_string().green(),
             ClaudeApiFormat::OpenAI => ClaudeApiFormat::OpenAI.to_string().yellow(),
@@ -139,6 +166,57 @@ impl LLMProvider for ClaudeWebProvider {
             format!("{}", elapsed.as_secs_f32()).green()
         );
         Ok(ClaudeProviderResponse { context, response })
+    }
+}
+
+/// Extract tool_use_id from the last user message if it contains a tool_result
+fn extract_tool_result_id(params: &CreateMessageParams) -> Option<String> {
+    let last_msg = params.messages.last()?;
+    if last_msg.role != Role::User {
+        return None;
+    }
+    match &last_msg.content {
+        MessageContent::Blocks { content } => {
+            // Find the last tool_result block
+            content.iter().rev().find_map(|block| {
+                if let ContentBlock::ToolResult { tool_use_id, .. } = block {
+                    Some(tool_use_id.clone())
+                } else {
+                    None
+                }
+            })
+        }
+        _ => None,
+    }
+}
+
+/// Build the tool_result payload to send to Claude.ai's /tool_result endpoint
+fn build_tool_result_payload(params: &CreateMessageParams) -> serde_json::Value {
+    let last_msg = params.messages.last().unwrap();
+    match &last_msg.content {
+        MessageContent::Blocks { content } => {
+            // Find the last tool_result block and serialize it
+            let tool_result = content.iter().rev().find_map(|block| {
+                if let ContentBlock::ToolResult {
+                    tool_use_id,
+                    content,
+                    is_error,
+                    ..
+                } = block
+                {
+                    Some(serde_json::json!({
+                        "type": "tool_result",
+                        "tool_use_id": tool_use_id,
+                        "content": content,
+                        "is_error": is_error.unwrap_or(false),
+                    }))
+                } else {
+                    None
+                }
+            });
+            tool_result.unwrap_or(serde_json::json!({}))
+        }
+        _ => serde_json::json!({}),
     }
 }
 

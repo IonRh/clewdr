@@ -24,9 +24,17 @@ impl ClaudeWebState {
         let system = merge_system(system.unwrap_or_default());
         let merged = merge_messages(msgs, system)?;
 
-        let mut tools = vec![];
+        let mut tools: Vec<Value> = vec![];
         if CLEWDR_CONFIG.load().web_search {
-            tools.push(Tool::web_search());
+            tools.push(web_search_tool());
+        }
+        // Pass client-provided tools to Claude.ai (native tool support)
+        if let Some(client_tools) = value.tools.take() {
+            for tool in client_tools {
+                if let Ok(v) = serde_json::to_value(&tool) {
+                    tools.push(v);
+                }
+            }
         }
         Some(WebRequestBody {
             max_tokens_to_sample: value.max_tokens,

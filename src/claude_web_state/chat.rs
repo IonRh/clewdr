@@ -202,3 +202,45 @@ impl ClaudeWebState {
             .await
     }
 }
+
+impl ClaudeWebState {
+    /// Send tool_result to Claude.ai's /tool_result endpoint and resume the stream
+    pub async fn send_tool_result(
+        &mut self,
+        tool_result: serde_json::Value,
+    ) -> Result<Response, ClewdrError> {
+        let org_uuid = self
+            .org_uuid
+            .to_owned()
+            .ok_or(ClewdrError::UnexpectedNone {
+                msg: "Organization UUID is not set for tool_result",
+            })?;
+        let conv_uuid = self
+            .conv_uuid
+            .to_owned()
+            .ok_or(ClewdrError::UnexpectedNone {
+                msg: "Conversation UUID is not set for tool_result",
+            })?;
+
+        let endpoint = self
+            .endpoint
+            .join(&format!(
+                "api/organizations/{}/chat_conversations/{}/tool_result",
+                org_uuid, conv_uuid
+            ))
+            .expect("Url parse error");
+
+        debug!("[TOOL] sending tool_result to {}", endpoint);
+
+        self.build_request(Method::POST, endpoint)
+            .json(&tool_result)
+            .header(ACCEPT, "text/event-stream")
+            .send()
+            .await
+            .context(WreqSnafu {
+                msg: "Failed to send tool_result",
+            })?
+            .check_claude()
+            .await
+    }
+}

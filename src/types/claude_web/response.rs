@@ -7,6 +7,7 @@ use bytes::Bytes;
 use eventsource_stream::{EventStream, Eventsource};
 use futures::{Stream, TryStreamExt};
 use serde::Deserialize;
+use tracing::debug;
 use url::Url;
 use wreq::Proxy;
 
@@ -14,9 +15,10 @@ use crate::{
     claude_code_state::ClaudeCodeState,
     claude_web_state::ClaudeWebState,
     error::{CheckClaudeErr, ClewdrError},
+    services::tool_call::TOOL_CALL_MANAGER,
     types::claude::{
         ContentBlock, CountMessageTokensResponse, CreateMessageParams, CreateMessageResponse,
-        Message, Role,
+        Message, Role, StreamEvent,
     },
     utils::print_out_text,
 };
@@ -88,6 +90,11 @@ impl ClaudeWebState {
             let endpoint = self.endpoint.clone();
             let proxy = self.proxy.clone();
             let client = self.client.clone();
+            let has_tools = self
+                .last_params
+                .as_ref()
+                .is_some_and(|p| p.tools.as_ref().is_some_and(|t| !t.is_empty()));
+            let tool_call_session = self.clone();
             // try to get precise input tokens via Claude Code count_tokens if enabled
             if crate::config::CLEWDR_CONFIG.load().enable_web_count_tokens
                 && let Some(tokens) = self.try_code_count_tokens().await
@@ -104,32 +111,107 @@ impl ClaudeWebState {
                 #[derive(serde::Deserialize)]
                 struct Data { completion: String }
                 futures::pin_mut!(stream);
+
+                // Tool call detection state
+                let mut tool_use_id: Option<String> = None;
+                let mut tool_use_index: Option<usize> = None;
+                let mut tool_call_break = false;
+
                 while let Some(event) = stream.try_next().await? {
                     if let Ok(d) = serde_json::from_str::<Data>(&event.data) {
                         acc.push_str(&d.completion);
                     }
+
+                    // Detect tool_use in the stream when tools are present
+                    if has_tools {
+                        if let Ok(se) = serde_json::from_str::<StreamEvent>(&event.data) {
+                            match &se {
+                                StreamEvent::ContentBlockStart { index, content_block } => {
+                                    if matches!(content_block, ContentBlock::ToolUse { .. }) {
+                                        if let ContentBlock::ToolUse { id, .. } = content_block {
+                                            tool_use_id = Some(id.clone());
+                                            tool_use_index = Some(*index);
+                                            debug!("[TOOL] detected tool_use start: {id}");
+                                        }
+                                    }
+                                }
+                                StreamEvent::ContentBlockStop { index } => {
+                                    if tool_use_index == Some(*index) && tool_use_id.is_some() {
+                                        debug!("[TOOL] tool_use block ended, injecting stop events");
+                                        // Yield the content_block_stop event first
+                                        let e = SseEvent::default().event(event.event.clone()).id(event.id.clone());
+                                        let e = if let Some(retry) = event.retry { e.retry(retry) } else { e };
+                                        yield e.data(event.data.clone());
+
+                                        // Inject message_delta with stop_reason=tool_use
+                                        let delta_data = serde_json::json!({
+                                            "type": "message_delta",
+                                            "delta": {"stop_reason": "tool_use", "stop_sequence": null},
+                                            "usage": {"output_tokens": 0}
+                                        });
+                                        yield SseEvent::default()
+                                            .event("message_delta")
+                                            .data(delta_data.to_string());
+
+                                        // Inject message_stop
+                                        let stop_data = serde_json::json!({"type": "message_stop"});
+                                        yield SseEvent::default()
+                                            .event("message_stop")
+                                            .data(stop_data.to_string());
+
+                                        // Register tool call for later tool_result
+                                        if let Some(id) = tool_use_id.take() {
+                                            TOOL_CALL_MANAGER.register(id, tool_call_session.clone()).await;
+                                        }
+                                        tool_call_break = true;
+                                        break;
+                                    }
+                                }
+                                _ => {}
+                            }
+                        }
+                    }
+
                     let e = SseEvent::default().event(event.event).id(event.id);
                     let e = if let Some(retry) = event.retry { e.retry(retry) } else { e };
                     yield e.data(event.data);
                 }
-                // on end of stream, compute output tokens and persist totals
-                if !acc.is_empty() {
-                    // Prefer official count_tokens if enabled and possible; else estimate locally
-                    let mut out = None;
-                    if enable_precise
-                        && let Some(model) = last_params.as_ref().map(|p| p.model.clone())
-                    {
-                        out = count_code_output_tokens_for_text(
-                            cookie.clone(), endpoint.clone(), proxy.clone(), client.clone(),
-                            model, acc.clone(), handle.clone()
-                        ).await.map(|v| v as u64);
-                    }
-                    let out = out.unwrap_or_else(|| {
-                        let usage = crate::types::claude::Usage { input_tokens: input_tokens as u32, output_tokens: 0 };
-                        let resp = crate::types::claude::CreateMessageResponse::text(acc.clone(), Default::default(), usage);
-                        resp.count_tokens() as u64
-                    });
-                    if let Some(mut c) = cookie.clone() {
+                // on end of stream, compute output tokens and persist totals (skip if tool_call)
+                if !tool_call_break {
+                    if !acc.is_empty() {
+                        let mut out = None;
+                        if enable_precise
+                            && let Some(model) = last_params.as_ref().map(|p| p.model.clone())
+                        {
+                            out = count_code_output_tokens_for_text(
+                                cookie.clone(), endpoint.clone(), proxy.clone(), client.clone(),
+                                model, acc.clone(), handle.clone()
+                            ).await.map(|v| v as u64);
+                        }
+                        let out = out.unwrap_or_else(|| {
+                            let usage = crate::types::claude::Usage { input_tokens: input_tokens as u32, output_tokens: 0 };
+                            let resp = crate::types::claude::CreateMessageResponse::text(acc.clone(), Default::default(), usage);
+                            resp.count_tokens() as u64
+                        });
+                        if let Some(mut c) = cookie.clone() {
+                            let family = last_params
+                                .as_ref()
+                                .map(|p| p.model.as_str())
+                                .map(|m| {
+                                    let m = m.to_ascii_lowercase();
+                                    if m.contains("opus") {
+                                        crate::config::ModelFamily::Opus
+                                    } else if m.contains("sonnet") {
+                                        crate::config::ModelFamily::Sonnet
+                                    } else {
+                                        crate::config::ModelFamily::Other
+                                    }
+                                })
+                                .unwrap_or(crate::config::ModelFamily::Other);
+                            c.add_and_bucket_usage(input_tokens, out, family);
+                            let _ = handle.return_cookie(c, None).await;
+                        }
+                    } else if let Some(mut c) = cookie.clone() {
                         let family = last_params
                             .as_ref()
                             .map(|p| p.model.as_str())
@@ -144,27 +226,9 @@ impl ClaudeWebState {
                                 }
                             })
                             .unwrap_or(crate::config::ModelFamily::Other);
-                        c.add_and_bucket_usage(input_tokens, out, family);
+                        c.add_and_bucket_usage(input_tokens, 0, family);
                         let _ = handle.return_cookie(c, None).await;
                     }
-                } else if let Some(mut c) = cookie.clone() {
-                    // still persist input tokens to maintain parity
-                    let family = last_params
-                        .as_ref()
-                        .map(|p| p.model.as_str())
-                        .map(|m| {
-                            let m = m.to_ascii_lowercase();
-                            if m.contains("opus") {
-                                crate::config::ModelFamily::Opus
-                            } else if m.contains("sonnet") {
-                                crate::config::ModelFamily::Sonnet
-                            } else {
-                                crate::config::ModelFamily::Other
-                            }
-                        })
-                        .unwrap_or(crate::config::ModelFamily::Other);
-                    c.add_and_bucket_usage(input_tokens, 0, family);
-                    let _ = handle.return_cookie(c, None).await;
                 }
             };
             // normalize error type for axum SSE
