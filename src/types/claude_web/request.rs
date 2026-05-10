@@ -43,6 +43,7 @@ pub struct WebRequestBody {
     pub timezone: String,
     #[serde(skip)]
     pub images: Vec<ImageSource>,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
     pub tools: Vec<Value>,
 }
 
