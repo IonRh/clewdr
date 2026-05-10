@@ -30,12 +30,20 @@ impl ClaudeWebState {
         }
         // Pass client-provided custom tools to Claude.ai web API
         // Only include tools that have both "name" and "input_schema" (custom tools)
-        // Skip built-in/known tools (bash, text_editor, web_search) as they use different formats
+        // Strip fields not accepted by Claude.ai web API
         if let Some(client_tools) = value.tools.take() {
             for tool in client_tools {
-                if let Ok(v) = serde_json::to_value(&tool) {
-                    if let Some(obj) = v.as_object() {
+                if let Ok(mut v) = serde_json::to_value(&tool) {
+                    if let Some(obj) = v.as_object_mut() {
                         if obj.contains_key("name") && obj.contains_key("input_schema") {
+                            // Remove fields that Claude.ai web API rejects
+                            obj.remove("eager_input_streaming");
+                            obj.remove("cache_control");
+                            obj.remove("allowed_callers");
+                            obj.remove("defer_loading");
+                            obj.remove("input_examples");
+                            obj.remove("strict");
+                            obj.remove("type");
                             tools.push(v);
                         }
                     }
