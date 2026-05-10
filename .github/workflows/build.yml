@@ -60,40 +60,13 @@ jobs:
     needs: build-frontend
     strategy:
       matrix:
-        os: [linux, musllinux, android, windows, macos]
-        target_arch: [x86_64, aarch64]
+        os: [musllinux]
+        target_arch: [x86_64]
         include:
-          # rust target vendor + system + environment
-          - os: android
-            target_vendor_sys_env: linux-android
-          - os: macos
-            target_vendor_sys_env: apple-darwin
-          - os: linux
-            target_vendor_sys_env: unknown-linux-gnu
           - os: musllinux
             target_vendor_sys_env: unknown-linux-musl
-          - os: windows
-            target_vendor_sys_env: pc-windows-msvc
-          # runner
-          - os: linux
-            target_arch: x86_64
-            runner: ubuntu-latest
-          - os: linux
-            target_arch: aarch64
-            runner: ubuntu-24.04-arm
-          - os: android
-            runner: ubuntu-latest
-          - os: windows
-            runner: windows-latest
-          - os: macos
-            runner: macos-latest
-          # musl packages
-          - os: musllinux
             cross: true
             runner: ubuntu-latest
-        exclude:
-          - os: android
-            target_arch: x86_64
 
     runs-on: ${{ matrix.runner }}
     steps:
