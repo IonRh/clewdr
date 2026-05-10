@@ -28,11 +28,17 @@ impl ClaudeWebState {
         if CLEWDR_CONFIG.load().web_search {
             tools.push(web_search_tool());
         }
-        // Pass client-provided tools to Claude.ai (native tool support)
+        // Pass client-provided custom tools to Claude.ai web API
+        // Only include tools that have both "name" and "input_schema" (custom tools)
+        // Skip built-in/known tools (bash, text_editor, web_search) as they use different formats
         if let Some(client_tools) = value.tools.take() {
             for tool in client_tools {
                 if let Ok(v) = serde_json::to_value(&tool) {
-                    tools.push(v);
+                    if let Some(obj) = v.as_object() {
+                        if obj.contains_key("name") && obj.contains_key("input_schema") {
+                            tools.push(v);
+                        }
+                    }
                 }
             }
         }
