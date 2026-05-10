@@ -124,93 +124,92 @@ impl ClaudeWebState {
                         acc.push_str(&d.completion);
                     }
 
-                    // Parse raw JSON to detect built-in tools and tool_result blocks
-                    if has_tools {
-                        if let Ok(raw) = serde_json::from_str::<serde_json::Value>(&event.data) {
-                            let event_type = raw.get("type").and_then(|v| v.as_str()).unwrap_or("");
-                            let index = raw.get("index").and_then(|v| v.as_u64()).map(|v| v as usize);
+                    // Parse raw JSON to detect and filter server-side tool events,
+                    // and handle client tool_use flow when tools are present
+                    if let Ok(raw) = serde_json::from_str::<serde_json::Value>(&event.data) {
+                        let event_type = raw.get("type").and_then(|v| v.as_str()).unwrap_or("");
+                        let index = raw.get("index").and_then(|v| v.as_u64()).map(|v| v as usize);
 
-                            match event_type {
-                                "content_block_start" => {
-                                    if let Some(cb) = raw.get("content_block") {
-                                        let block_type = cb.get("type").and_then(|v| v.as_str()).unwrap_or("");
-                                        match block_type {
-                                            "tool_use" => {
-                                                let name = cb.get("name").and_then(|v| v.as_str()).unwrap_or("");
-                                                let id = cb.get("id").and_then(|v| v.as_str()).unwrap_or("");
-                                                // Server-side tools have extra fields like "message", "integration_name"
-                                                // or have builtin_ prefix or are known internal tools
-                                                let is_server_tool = name.starts_with("builtin_")
-                                                    || cb.get("message").and_then(|v| v.as_str()).is_some()
-                                                    || cb.get("integration_name").and_then(|v| v.as_str()).is_some();
+                        match event_type {
+                            "content_block_start" => {
+                                if let Some(cb) = raw.get("content_block") {
+                                    let block_type = cb.get("type").and_then(|v| v.as_str()).unwrap_or("");
+                                    match block_type {
+                                        "tool_use" => {
+                                            let name = cb.get("name").and_then(|v| v.as_str()).unwrap_or("");
+                                            let id = cb.get("id").and_then(|v| v.as_str()).unwrap_or("");
+                                            // Server-side tools have extra fields like "message", "integration_name"
+                                            // or have builtin_ prefix
+                                            let is_server_tool = name.starts_with("builtin_")
+                                                || cb.get("message").and_then(|v| v.as_str()).is_some()
+                                                || cb.get("integration_name").and_then(|v| v.as_str()).is_some();
 
-                                                if is_server_tool {
-                                                    if let Some(idx) = index {
-                                                        suppressed_indices.insert(idx);
-                                                    }
-                                                    debug!("[TOOL] suppressing server-side tool: {name}");
-                                                    continue;
-                                                } else {
-                                                    // Client tool - handle tool_use flow
-                                                    tool_use_id = Some(id.to_string());
-                                                    tool_use_index = index;
-                                                    debug!("[TOOL] detected client tool_use start: {id}");
-                                                }
-                                            }
-                                            "tool_result" => {
-                                                // Always suppress tool_result blocks (server-side only)
+                                            if is_server_tool {
                                                 if let Some(idx) = index {
                                                     suppressed_indices.insert(idx);
                                                 }
-                                                debug!("[TOOL] suppressing tool_result block");
+                                                debug!("[TOOL] suppressing server-side tool: {name}");
                                                 continue;
+                                            } else if has_tools {
+                                                // Client tool - handle tool_use flow
+                                                tool_use_id = Some(id.to_string());
+                                                tool_use_index = index;
+                                                debug!("[TOOL] detected client tool_use start: {id}");
                                             }
-                                            _ => {}
                                         }
-                                    }
-                                }
-                                "content_block_delta" | "content_block_stop" => {
-                                    if let Some(idx) = index {
-                                        if suppressed_indices.contains(&idx) {
+                                        "tool_result" => {
+                                            // Always suppress tool_result blocks (server-side only)
+                                            if let Some(idx) = index {
+                                                suppressed_indices.insert(idx);
+                                            }
+                                            debug!("[TOOL] suppressing tool_result block");
                                             continue;
                                         }
-                                    }
-                                    // Handle client tool_use stop
-                                    if event_type == "content_block_stop" {
-                                        if tool_use_index == index && tool_use_id.is_some() {
-                                            debug!("[TOOL] client tool_use block ended, injecting stop events");
-                                            // Yield the content_block_stop event first
-                                            let e = SseEvent::default().event(event.event.clone()).id(event.id.clone());
-                                            let e = if let Some(retry) = event.retry { e.retry(retry) } else { e };
-                                            yield e.data(event.data.clone());
-
-                                            // Inject message_delta with stop_reason=tool_use
-                                            let delta_data = serde_json::json!({
-                                                "type": "message_delta",
-                                                "delta": {"stop_reason": "tool_use", "stop_sequence": null},
-                                                "usage": {"output_tokens": 0}
-                                            });
-                                            yield SseEvent::default()
-                                                .event("message_delta")
-                                                .data(delta_data.to_string());
-
-                                            // Inject message_stop
-                                            let stop_data = serde_json::json!({"type": "message_stop"});
-                                            yield SseEvent::default()
-                                                .event("message_stop")
-                                                .data(stop_data.to_string());
-
-                                            // Register tool call for later tool_result
-                                            if let Some(id) = tool_use_id.take() {
-                                                TOOL_CALL_MANAGER.register(id, tool_call_session.clone()).await;
-                                            }
-                                            tool_call_break = true;
-                                            break;
-                                        }
+                                        _ => {}
                                     }
                                 }
-                                _ => {}
                             }
+                            "content_block_delta" | "content_block_stop" => {
+                                if let Some(idx) = index {
+                                    if suppressed_indices.contains(&idx) {
+                                        continue;
+                                    }
+                                }
+                                // Handle client tool_use stop
+                                if has_tools && event_type == "content_block_stop" {
+                                    if tool_use_index == index && tool_use_id.is_some() {
+                                        debug!("[TOOL] client tool_use block ended, injecting stop events");
+                                        // Yield the content_block_stop event first
+                                        let e = SseEvent::default().event(event.event.clone()).id(event.id.clone());
+                                        let e = if let Some(retry) = event.retry { e.retry(retry) } else { e };
+                                        yield e.data(event.data.clone());
+
+                                        // Inject message_delta with stop_reason=tool_use
+                                        let delta_data = serde_json::json!({
+                                            "type": "message_delta",
+                                            "delta": {"stop_reason": "tool_use", "stop_sequence": null},
+                                            "usage": {"output_tokens": 0}
+                                        });
+                                        yield SseEvent::default()
+                                            .event("message_delta")
+                                            .data(delta_data.to_string());
+
+                                        // Inject message_stop
+                                        let stop_data = serde_json::json!({"type": "message_stop"});
+                                        yield SseEvent::default()
+                                            .event("message_stop")
+                                            .data(stop_data.to_string());
+
+                                        // Register tool call for later tool_result
+                                        if let Some(id) = tool_use_id.take() {
+                                            TOOL_CALL_MANAGER.register(id, tool_call_session.clone()).await;
+                                        }
+                                        tool_call_break = true;
+                                        break;
+                                    }
+                                }
+                            }
+                            _ => {}
                         }
                     }
 
