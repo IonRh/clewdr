@@ -214,6 +214,11 @@ impl ClaudeWebState {
                         }
                     }
 
+                    // Filter out Claude.ai-specific non-standard events
+                    if event.event == "message_limit" {
+                        continue;
+                    }
+
                     let e = SseEvent::default().event(event.event).id(event.id);
                     let e = if let Some(retry) = event.retry { e.retry(retry) } else { e };
                     yield e.data(event.data);
